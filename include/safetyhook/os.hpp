@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <expected.hpp>
 #include <functional>
+#include <vector>
 #else
 import std.compat;
 #endif
@@ -55,6 +56,21 @@ std::expected<uint32_t, OsError> SAFETYHOOK_API vm_protect(uint8_t* address, siz
 std::expected<uint32_t, OsError> SAFETYHOOK_API vm_protect(uint8_t* address, size_t size, uint32_t access);
 std::expected<VmBasicInfo, OsError> SAFETYHOOK_API vm_query(uint8_t* address);
 bool SAFETYHOOK_API vm_is_readable(uint8_t* address, size_t size);
+
+/// @brief A snapshot of the address space for answering many vm_query calls in a row.
+/// @note On Linux every vm_query reads and parses /proc/self/maps, so a caller that walks the address space
+/// should take one snapshot instead. On Windows queries are forwarded to vm_query.
+class SAFETYHOOK_API VmSnapshot {
+public:
+    VmSnapshot();
+
+    [[nodiscard]] std::expected<VmBasicInfo, OsError> query(uint8_t* address) const;
+
+private:
+    std::vector<VmBasicInfo> m_regions; // Mapped regions, sorted by address.
+    bool m_valid{};
+};
+
 bool SAFETYHOOK_API vm_is_writable(uint8_t* address, size_t size);
 bool SAFETYHOOK_API vm_is_executable(uint8_t* address);
 

@@ -100,6 +100,12 @@ std::expected<VmBasicInfo, OsError> vm_query(uint8_t* address) {
     return info;
 }
 
+VmSnapshot::VmSnapshot() = default;
+
+std::expected<VmBasicInfo, OsError> VmSnapshot::query(uint8_t* address) const {
+    return vm_query(address);
+}
+
 bool vm_is_readable(uint8_t* address, size_t size) {
     return IsBadReadPtr(address, size) == FALSE;
 }
