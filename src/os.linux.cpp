@@ -264,8 +264,10 @@ SystemInfo system_info() {
 
 void trap_threads([[maybe_unused]] uint8_t* from, [[maybe_unused]] uint8_t* to, [[maybe_unused]] size_t len,
     const std::function<void()>& run_fn) {
-    auto from_protect = vm_protect(from, len, VM_ACCESS_RW);
-    auto to_protect = vm_protect(to, len, VM_ACCESS_RW);
+    // Linux has no way to suspend the other threads, so they keep running while the patch is written. RWX rather
+    // than RW keeps the pages executable for any thread inside other code on them (or another hook's trampoline).
+    auto from_protect = vm_protect(from, len, VM_ACCESS_RWX);
+    auto to_protect = vm_protect(to, len, VM_ACCESS_RWX);
     run_fn();
     if (to_protect.has_value()) {
         vm_protect(to, len, to_protect.value());
