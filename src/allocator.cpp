@@ -221,12 +221,33 @@ std::expected<uint8_t*, Allocator::Error> Allocator::allocate_nearby_memory(
     search_start = std::max(search_start, si.min_address);
     search_end = std::min(search_end, si.max_address);
     desired_address = align_up(desired_address, si.allocation_granularity);
+    VmSnapshot vm{};
     VmBasicInfo mbi{};
+
+    // Allocates at p, which the snapshot says is free. If that fails, another thread may have mapped memory
+    // there since the snapshot was taken, so take a new one and retry once if p is still free.
+    auto allocate_at = [&](uint8_t* p) -> uint8_t* {
+        if (auto* allocation_address = attempt_allocation(p); allocation_address != nullptr) {
+            return allocation_address;
+        }
+
+        vm = VmSnapshot{};
+
+        if (auto result = vm.query(p)) {
+            mbi = result.value();
+
+            if (mbi.is_free) {
+                return attempt_allocation(p);
+            }
+        }
+
+        return nullptr;
+    };
 
     // Search backwards from the desired_address.
     for (auto p = desired_address; p > search_start && in_range(p, desired_addresses, max_distance);
          p = align_down(mbi.address - 1, si.allocation_granularity)) {
-        auto result = vm_query(p);
+        auto result = vm.query(p);
 
         if (!result) {
             break;
@@ -238,14 +259,14 @@ std::expected<uint8_t*, Allocator::Error> Allocator::allocate_nearby_memory(
             continue;
         }
 
-        if (auto allocation_address = attempt_allocation(p); allocation_address != nullptr) {
+        if (auto allocation_address = allocate_at(p); allocation_address != nullptr) {
             return allocation_address;
         }
     }
 
     // Search forwards from the desired_address.
     for (auto p = desired_address; p < search_end && in_range(p, desired_addresses, max_distance); p += mbi.size) {
-        auto result = vm_query(p);
+        auto result = vm.query(p);
 
         if (!result) {
             break;
@@ -257,7 +278,7 @@ std::expected<uint8_t*, Allocator::Error> Allocator::allocate_nearby_memory(
             continue;
         }
 
-        if (auto allocation_address = attempt_allocation(p); allocation_address != nullptr) {
+        if (auto allocation_address = allocate_at(p); allocation_address != nullptr) {
             return allocation_address;
         }
     }

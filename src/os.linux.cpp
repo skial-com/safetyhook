@@ -2,7 +2,13 @@
 
 #if SAFETYHOOK_OS_LINUX
 
-#include <cstdio>
+#include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+
+#include <fcntl.h>
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -11,10 +17,19 @@
 
 #include "safetyhook/os.hpp"
 
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
 namespace safetyhook {
 std::expected<uint8_t*, OsError> vm_allocate(uint8_t* address, size_t size, VmAccess access) {
     int prot = 0;
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+
+    // Like VirtualAlloc, fail instead of placing the memory somewhere else when the address is taken.
+    if (address != nullptr) {
+        flags |= MAP_FIXED_NOREPLACE;
+    }
 
     if (access == VM_ACCESS_R) {
         prot = PROT_READ;
@@ -31,6 +46,12 @@ std::expected<uint8_t*, OsError> vm_allocate(uint8_t* address, size_t size, VmAc
     auto* result = mmap(address, size, prot, flags, -1, 0);
 
     if (result == MAP_FAILED) {
+        return tl::unexpected{OsError::FAILED_TO_ALLOCATE};
+    }
+
+    // Kernels before 4.17 ignore MAP_FIXED_NOREPLACE and treat the address as a hint.
+    if (address != nullptr && result != address) {
+        munmap(result, size);
         return tl::unexpected{OsError::FAILED_TO_ALLOCATE};
     }
 
@@ -89,75 +110,126 @@ std::expected<uint32_t, OsError> vm_protect(uint8_t* address, size_t size, uint3
     return old_protect;
 }
 
+namespace {
+// Reads the mapped regions from /proc/self/maps in one pass. Lines are "start-end perms offset dev inode path".
+bool read_maps(std::vector<VmBasicInfo>& regions) {
+    auto fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+
+    if (fd == -1) {
+        return false;
+    }
+
+    std::string buf;
+    char chunk[16384];
+
+    for (;;) {
+        auto n = read(fd, chunk, sizeof(chunk));
+
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            close(fd);
+            return false;
+        }
+
+        if (n == 0) {
+            break;
+        }
+
+        buf.append(chunk, static_cast<size_t>(n));
+    }
+
+    close(fd);
+
+    regions.clear();
+
+    const char* p = buf.c_str();
+
+    while (*p != '\0') {
+        char* e{};
+        auto start = strtoul(p, &e, 16);
+
+        if (e == p || *e != '-') {
+            break;
+        }
+
+        p = e + 1;
+        auto end = strtoul(p, &e, 16);
+
+        if (e == p || *e != ' ' || e[1] == '\0' || e[2] == '\0' || e[3] == '\0') {
+            break;
+        }
+
+        VmBasicInfo info{};
+        info.address = reinterpret_cast<uint8_t*>(start);
+        info.size = end - start;
+        info.access = VmAccess(e[1] == 'r', e[2] == 'w', e[3] == 'x');
+        info.is_free = false;
+        regions.push_back(info);
+
+        p = strchr(e, '\n');
+
+        if (p == nullptr) {
+            break;
+        }
+
+        ++p;
+    }
+
+    return true;
+}
+
+// Same answer as walking the maps in order: the mapping that contains address, or the unmapped gap before the
+// first mapping above it (gaps start no lower than system_info().min_address).
+std::expected<VmBasicInfo, OsError> query_regions(const std::vector<VmBasicInfo>& regions, uint8_t* address) {
+    auto it = std::upper_bound(regions.begin(), regions.end(), address,
+        [](uint8_t* addr, const VmBasicInfo& r) { return addr < r.address + r.size; });
+
+    if (it == regions.end()) {
+        return tl::unexpected{OsError::FAILED_TO_QUERY};
+    }
+
+    if (address >= it->address) {
+        return *it;
+    }
+
+    auto* last_end = it == regions.begin() ? system_info().min_address : (it - 1)->address + (it - 1)->size;
+
+    if (last_end < it->address && address >= last_end) {
+        VmBasicInfo info{};
+        info.address = last_end;
+        info.size = static_cast<size_t>(it->address - last_end);
+        info.access = VmAccess();
+        info.is_free = true;
+        return info;
+    }
+
+    return tl::unexpected{OsError::FAILED_TO_QUERY};
+}
+} // namespace
+
 std::expected<VmBasicInfo, OsError> vm_query(uint8_t* address) {
-    auto* maps = fopen("/proc/self/maps", "r");
+    std::vector<VmBasicInfo> regions;
 
-    if (maps == nullptr) {
+    if (!read_maps(regions)) {
         return tl::unexpected{OsError::FAILED_TO_QUERY};
     }
 
-    char line[512];
-    unsigned long start;
-    unsigned long end;
-    char perms[5];
-    unsigned long offset;
-    int dev_major;
-    int dev_minor;
-    unsigned long inode;
-    char path[256];
-    unsigned long last_end =
-        reinterpret_cast<unsigned long>(system_info().min_address); // Track the end address of the last mapping.
-    auto addr = reinterpret_cast<unsigned long>(address);
-    std::optional<VmBasicInfo> info = std::nullopt;
+    return query_regions(regions, address);
+}
 
-    while (fgets(line, sizeof(line), maps) != nullptr) {
-        path[0] = '\0';
+VmSnapshot::VmSnapshot() {
+    m_valid = read_maps(m_regions);
+}
 
-        sscanf(line, "%lx-%lx %4s %lx %x:%x %lu %255[^\n]", &start, &end, perms, &offset, &dev_major, &dev_minor,
-            &inode, path);
-
-        if (last_end < start && addr >= last_end && addr < start) {
-            info.emplace();
-            info->address = reinterpret_cast<uint8_t*>(last_end);
-            info->size = start - last_end;
-            info->access = VmAccess();
-            info->is_free = true;
-
-            break;
-        }
-
-        last_end = end;
-
-        if (addr >= start && addr < end) {
-            info.emplace();
-            info->address = reinterpret_cast<uint8_t*>(start);
-            info->size = end - start,
-            info->access = VmAccess();
-            info->is_free = false;
-
-            if (perms[0] == 'r') {
-                info->access.read = true;
-            }
-
-            if (perms[1] == 'w') {
-                info->access.write = true;
-            }
-
-            if (perms[2] == 'x') {
-                info->access.execute = true;
-            }
-
-            break;
-        }
-    }
-
-    fclose(maps);
-
-    if (!info.has_value()) {
+std::expected<VmBasicInfo, OsError> VmSnapshot::query(uint8_t* address) const {
+    if (!m_valid) {
         return tl::unexpected{OsError::FAILED_TO_QUERY};
     }
 
-    return info.value();
+    return query_regions(m_regions, address);
 }
 
 bool vm_is_readable(uint8_t* address, [[maybe_unused]] size_t size) {
